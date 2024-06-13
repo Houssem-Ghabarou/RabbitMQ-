@@ -1,58 +1,53 @@
-const express = require('express');
-const amqplib = require('amqplib');
+import express from 'express';
+import amqplib from 'amqplib';
 const app = express();
-const port = 3000;
-
+const port = process.env.PORT || 3000;
 app.use(express.json());
 
-// Function to handle incoming data
 function handleData(data) {
   return data;
 }
 
-// Actions object for handling different actions
 const actions = {
   handleData: handleData,
 };
 
-// Function to send a request and wait for response
 async function sendRequestAndWaitForResponse(functionName, metadata) {
   try {
     const channel = app.get('channel');
-    const queue = 'request_queue';
-    const responseQueue = 'response_queue';
+    const queue = process.env.REQUEST_QUEUE || 'request_queue';
+    const responseQueue = process.env.RESPONSE_QUEUE || 'response_queue';
 
-    await channel.assertQueue(queue, { durable: false });
-    await channel.assertQueue(responseQueue, { durable: false });
+    await channel?.assertQueue(queue, { durable: false });
+    await channel?.assertQueue(responseQueue, { durable: false });
 
     const data = JSON.stringify({
       functionName,
       metadata,
     });
 
-    // Send the request to the request queue
-    channel.sendToQueue(queue, Buffer.from(data), {
+    // Sending the request to the request queue
+    channel?.sendToQueue(queue, Buffer.from(data), {
       replyTo: responseQueue,
     });
   } catch (e) {
-    console.log('Error sending request:', e);
-    throw e; // Rethrow the error to be caught by the API endpoint handler
+    console.error('Error sending request:', e);
   }
 }
 
-// API endpoint to initiate a request
+//request initiation
 app.post('/api/request', async (req, res) => {
   const { functionName, params, method, authorization, api, body } = req.body;
   try {
     const metadata = {
-      params: params ? params : null,
-      method: method ? method : 'GET',
-      authorization: authorization ? authorization : null,
-      api: api ? api : null,
-      body: body ? body : null,
+      params: params || null,
+      method: method || 'GET',
+      authorization: authorization || null,
+      api: api || null,
+      body: body || null,
     };
 
-    // Send the request asynchronously, no wait for response
+    // no wait for the response
     sendRequestAndWaitForResponse(functionName, metadata);
 
     res.json({ response: 'Request initiated successfully' });
@@ -62,77 +57,91 @@ app.post('/api/request', async (req, res) => {
   }
 });
 
-// Function to connect to RabbitMQ
-function connectToRabbitMQ() {
-  amqplib
-    .connect('amqp://localhost')
-    .then((conn) => {
-      console.log('Connected to RabbitMQ');
-      app.set('connection', conn);
-      conn.on('error', (err) => {
-        app.emit('errorRabbitMQConnection', err);
-      });
-      conn.on('close', () => {
-        console.error('Connection to RabbitMQ closed');
-        app.emit(
-          'errorRabbitMQConnection',
-          new Error('Connection to RabbitMQ closed')
-        );
-      });
-      createChannelRabbitMQ();
-    })
-    .catch((err) => {
-      console.error('Error connecting to RabbitMQ:', err);
-      setTimeout(connectToRabbitMQ, 5000); // Retry connection after 5 seconds
-    });
-}
+// RabbitMQ connection
+async function connectToRabbitMQ() {
+  try {
+    const connection = await amqplib.connect('amqp://localhost');
 
+    app.set('connection', connection);
+    createChannelRabbitMQ(); // Creating a channel after successful connection
+  } catch (err) {
+    console.error('Error connecting to RabbitMQ:', err);
+    app.set('connection', null);
+    app.emit('errorRabbitMQConnection', err);
+  }
+}
 //  creating a channel on RabbitMQ
-function createChannelRabbitMQ() {
-  const conn = app.get('connection');
-  conn
-    .createChannel()
-    .then((channel) => {
-      console.log('Channel created');
-      app.set('channel', channel);
-      channel.on('error', (err) => {
-        console.error('Channel error:', err);
-        app.emit('errorRabbitMQChannel', err);
-      });
-      channel.on('close', () => {
-        console.error('Channel closed');
-        app.emit('errorRabbitMQChannel', new Error('Channel closed'));
-      });
-      initializeConsuming(channel); // Start consuming messages
-    })
-    .catch((err) => {
-      console.error('Error creating RabbitMQ channel:', err);
-      setTimeout(createChannelRabbitMQ, 5000); // Retry channel creation after 5 seconds
+async function createChannelRabbitMQ() {
+  try {
+    const conn = app.get('connection');
+    const channel = await conn?.createChannel();
+
+    channel.on('error', (err) => {
+      console.error('Error with RabbitMQ channel:', err);
+      app.set('channel', null);
+      app.emit('errorRabbitMQChannel', err);
     });
+    channel.on('close', (err) => {
+      console.log('RabbitMQ channel closed');
+      app.set('channel', null);
+      app.emit(
+        'errorRabbitMQConnection',
+        new Error('RabbitMQ channel closed so reconnection is needed')
+      ); // triggering reconnection because the channel is closed
+    });
+
+    app.set('channel', channel);
+    initializeConsuming(channel); // Initialize consuming messages after creating a channel
+  } catch (err) {
+    console.error('Error creating channel:', err);
+    app.set('channel', null);
+    app.emit('errorRabbitMQChannel', err); ////////////I NEED TO CHECK THIS IF IT IS WORKING*************************
+  }
 }
 
 // initialize consuming messages
 function initializeConsuming(channel) {
-  const responseQueue = 'response_queue';
+  const responseQueue = process.env.RESPONSE_QUEUE || 'response_queue';
+  const MAX_CONSUMING_MESSAGES_PER_MINUTE = 1;
   retryAssertQueue(channel, responseQueue)
     .then(() => {
-      channel.consume(
-        responseQueue,
-        (msg) => {
-          const data = msg.content.toString();
-          const { action, response } = JSON.parse(data);
+      setTimeout(() => {
+        channel?.consume(
+          responseQueue,
+          async (msg) => {
+            try {
+              if (!msg) {
+                console.error('No message received');
+                return;
+              }
 
-          if (action && actions[action]) {
-            const result = actions[action](response);
-            console.log('Result:', result);
-          } else {
-            console.log('No action found for:', action);
-          }
+              const data = msg.content.toString();
+              if (!data) {
+                console.error('No data found in message');
+                channel.ack(msg);
+                return;
+              }
 
-          channel.ack(msg);
-        },
-        { noAck: false }
-      );
+              const { action, response } = JSON.parse(data);
+
+              if (action && actions?.[action]) {
+                const result = actions?.[action](response);
+                console.log('Result:', result);
+              } else {
+                console.log('No action found for:', action);
+              }
+
+              channel.ack(msg);
+            } catch (error) {
+              console.error('Error processing message:', error);
+              if (msg) {
+                channel.nack(msg, false, false); // Reject the message without requeueing
+              }
+            }
+          },
+          { noAck: false }
+        );
+      }, (1000 * 60) / MAX_CONSUMING_MESSAGES_PER_MINUTE);
     })
     .catch((err) => {
       console.error('Error asserting queue:', err);
@@ -143,7 +152,7 @@ function initializeConsuming(channel) {
 // Retry asserting a queue
 async function retryAssertQueue(channel, queueName) {
   try {
-    await channel.assertQueue(queueName, { durable: false });
+    await channel?.assertQueue(queueName, { durable: false });
     console.log(`Queue ${queueName} asserted successfully`);
   } catch (err) {
     console.error('Error asserting queue:', err);
@@ -152,13 +161,13 @@ async function retryAssertQueue(channel, queueName) {
 
 // RabbitMQ connection errros
 app.on('errorRabbitMQConnection', async (err) => {
-  console.error('Error connecting to RabbitMQ:', err);
+  console.error('From express events:Error connecting to RabbitMQ:', err);
   setTimeout(connectToRabbitMQ, 5000); // Retry connection after 5 seconds
 });
 
 // RabbitMQ channel errors
 app.on('errorRabbitMQChannel', (err) => {
-  console.error('Error with RabbitMQ channel:', err);
+  console.error('From express events:Error with RabbitMQ channel:', err);
   setTimeout(createChannelRabbitMQ, 5000); // Retry channel creation after 5 seconds
 });
 
@@ -169,3 +178,5 @@ connectToRabbitMQ();
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
 });
+
+export default app;
